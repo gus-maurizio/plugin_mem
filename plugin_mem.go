@@ -6,12 +6,27 @@ import (
 		"fmt"
 		"github.com/shirou/gopsutil/mem"
 		log "github.com/sirupsen/logrus"
+		"github.com/prometheus/client_golang/prometheus"
+		"github.com/prometheus/client_golang/prometheus/promhttp"
+		"net/http"
     	"time"
 )
 
-var PluginEnv		mem.VirtualMemoryStat
 var PluginConfig 	map[string]map[string]map[string]interface{}
 var PluginData		map[string]interface{}
+
+//	Define the metrics we wish to expose
+var memIndicator = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "sreagent_mem_metrics",
+		Help: "MEM Load Utilization Saturation Errors Throughput Latency",
+	}, []string{"use"} )
+
+var memUsage = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "sreagent_mem_usage",
+		Help: "MEM usage details",
+	}, []string{"mem"} )
 
 
 func PluginMeasure() ([]byte, []byte, float64) {
@@ -22,7 +37,7 @@ func PluginMeasure() ([]byte, []byte, float64) {
 	// Apply USE methodology for MEM
 	// U: 	Usage (usually throughput/latency indicators)
 	//		In this case we define as Available memory % 0-100
-	// S:	Saturation (measured relevant to Design point)
+	// S:	Saturation (paging)
 	// E:	Errors (not applicable for MEM)
 	// Prepare the data
 	PluginData["mem"]    		= 100.0 * float64((PluginData["virtualmem"].(mem.VirtualMemoryStat).Total - PluginData["virtualmem"].(mem.VirtualMemoryStat).Available))/float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Total)
@@ -30,12 +45,24 @@ func PluginMeasure() ([]byte, []byte, float64) {
 	PluginData["latency"]  		= 0.00
 	PluginData["throughput"]  	= 0.00
 	PluginData["throughputmax"] = 0.00
-	PluginData["saturation"]    = 100.0 * PluginData["use"].(float64) / PluginConfig["alert"]["mem"]["design"].(float64)
+	PluginData["saturation"]    = 100.0 * float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).SwapCached)/float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Total)
 	PluginData["errors"]    	= 0.00
 
-	myMeasure, _				:= json.Marshal(PluginData["mem"])
-	myMeasureRaw, _ 			:= json.Marshal(PluginData)
-	return myMeasure, myMeasureRaw, float64(time.Now().UnixNano())/1e9
+	// Update metrics related to the plugin
+	memUsage.With(prometheus.Labels{"mem":  "memtotal"}).Set( float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Total)/1024.0 )
+	memUsage.With(prometheus.Labels{"mem":  "available"}).Set( float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Available)/1024.0 )
+	memUsage.With(prometheus.Labels{"mem":  "free"}).Set( float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Free)/1024.0 )
+	memUsage.With(prometheus.Labels{"mem":  "used"}).Set( float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Used)/1024.0 )
+	memUsage.With(prometheus.Labels{"mem":  "buffers"}).Set( float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Buffers)/1024.0 )
+	memUsage.With(prometheus.Labels{"mem":  "cached"}).Set( float64(PluginData["virtualmem"].(mem.VirtualMemoryStat).Cached)/1024.0 )
+
+	memIndicator.With(prometheus.Labels{"use":  "utilization"}).Set(PluginData["use"].(float64))
+	memIndicator.With(prometheus.Labels{"use":  "saturation"}).Set(PluginData["saturation"].(float64))
+	memIndicator.With(prometheus.Labels{"use":  "throughput"}).Set(PluginData["throughput"].(float64))
+	memIndicator.With(prometheus.Labels{"use":  "errors"}).Set(PluginData["errors"].(float64))
+
+	myMeasure, _				:= json.Marshal(PluginData)
+	return myMeasure, []byte{}, float64(time.Now().UnixNano())/1e9
 }
 
 func PluginAlert(measure []byte) (string, string, bool, error) {
@@ -75,13 +102,16 @@ func InitPlugin(config string) () {
 	if PluginConfig == nil {
 		PluginConfig = make(map[string]map[string]map[string]interface{},20)
 	}
-	vmem, _		:= mem.VirtualMemory()
-	PluginEnv	= *vmem
+
+	// Register metrics with prometheus
+	prometheus.MustRegister(memIndicator)
+	prometheus.MustRegister(memUsage)
+
 	err := json.Unmarshal([]byte(config), &PluginConfig)
 	if err != nil {
 		log.WithFields(log.Fields{"config": config}).Error("failed to unmarshal config")
 	}
-	log.WithFields(log.Fields{"pluginconfig": PluginConfig, "pluginenv": PluginEnv }).Info("InitPlugin mem")
+	log.WithFields(log.Fields{"pluginconfig": PluginConfig}).Info("InitPlugin mem")
 }
 
 
@@ -92,10 +122,20 @@ func main() {
 				          }
 				}
 				`
+
+	//--------------------------------------------------------------------------//
+	// time to start a prometheus metrics server
+	// and export any metrics on the /metrics endpoint.
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		http.ListenAndServe(":8999", nil)
+	}()
+	//--------------------------------------------------------------------------//
+
 	InitPlugin(config)
 	log.WithFields(log.Fields{"PluginConfig": PluginConfig}).Info("InitPlugin")
 	tickd := 1* time.Second
-	for i := 1; i <= 2; i++ {
+	for i := 1; i <= 20; i++ {
 		tick := time.Now().UnixNano()
 		measure, measureraw, measuretimestamp := PluginMeasure()
 		alertmsg, alertlvl, isAlert, err := PluginAlert(measure)
