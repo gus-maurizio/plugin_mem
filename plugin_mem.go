@@ -69,7 +69,7 @@ func PluginAlert(measure []byte) (string, string, bool, error) {
 	alertMsg  := ""
 	alertLvl  := ""
 	alertFlag := false
-	alertErr  := errors.New("nothing")
+	alertErr  := errors.New("no error")
 
 	// Check that the mem overall value is within range
 	switch {
